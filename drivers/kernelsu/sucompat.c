@@ -197,6 +197,7 @@ int ksu_handle_devpts(struct inode *inode)
 
 	return 0;
 }
+EXPORT_SYMBOL(ksu_handle_devpts);
 
 #ifdef CONFIG_KPROBES
 
