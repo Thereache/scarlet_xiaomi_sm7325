@@ -217,6 +217,8 @@ int xiaomitouch_register_modedata(int touchId,
 		touch_data->getModeAll = data->getModeAll;
 	if (data->palm_sensor_write)
 		touch_data->palm_sensor_write = data->palm_sensor_write;
+	if (data->panel_vendor_read)
+		touch_data->panel_vendor_read = data->panel_vendor_read;
 	if (data->panel_color_read)
 		touch_data->panel_color_read = data->panel_color_read;
 	if (data->panel_display_read)
