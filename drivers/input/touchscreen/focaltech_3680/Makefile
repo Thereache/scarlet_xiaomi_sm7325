@@ -7,8 +7,12 @@ focaltech_touch-y := \
 	focaltech_gesture.o \
 	focaltech_esdcheck.o \
 	focaltech_point_report_check.o \
-	focaltech_test/focaltech_test.o \
-	focaltech_test/focaltech_test_ini.o \
-	focaltech_test/supported_ic/focaltech_test_ft5662.o \
 	focaltech_flash.o \
 	focaltech_spi.o
+
+ifdef CONFIG_TOUCHSCREEN_FOCALTECH_TEST
+focaltech_touch-y += \
+	focaltech_test/focaltech_test.o \
+	focaltech_test/focaltech_test_ini.o \
+	focaltech_test/supported_ic/focaltech_test_ft5662.o
+endif
