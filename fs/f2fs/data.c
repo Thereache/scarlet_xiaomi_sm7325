@@ -984,7 +984,7 @@ next:
 	    (!io_is_mergeable(sbi, io->bio, io, fio, io->last_block_in_bio,
 			      fio->new_blkaddr) ||
 	     !f2fs_crypt_mergeable_bio(io->bio, fio->page->mapping->host,
-				       bio_page->index, fio)))
+				       fio->page->index, fio)))
 		__submit_merged_bio(io);
 alloc_new:
 	if (io->bio == NULL) {
@@ -997,7 +997,8 @@ alloc_new:
 		}
 		io->bio = __bio_alloc(fio, BIO_MAX_PAGES);
 		f2fs_set_bio_crypt_ctx(io->bio, fio->page->mapping->host,
-				       bio_page->index, fio, GFP_NOIO);
+				       fio->page->index, fio,
+				       GFP_NOIO);
 		io->fio = *fio;
 	}
 
