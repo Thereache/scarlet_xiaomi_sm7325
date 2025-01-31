@@ -2,7 +2,7 @@
 /*
  * QTI hardware key manager driver.
  *
- * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2020, The Linux Foundation. All rights reserved.
  */
 
 #include <linux/types.h>
@@ -19,6 +19,8 @@
 #include <linux/delay.h>
 #include <linux/crypto.h>
 #include <linux/bitops.h>
+#include <crypto/hash.h>
+#include <crypto/sha.h>
 #include <linux/iommu.h>
 
 #include <linux/hwkm.h>
@@ -43,28 +45,11 @@ int retries;
 for (retries = 0; !(cond) && (retries < MAX_RETRIES); retries++)
 
 #define EXPECTED_UNWRAP_KEY_SIZE 68
+
 #define ICEMEM_SLAVE_TPKEY_VAL	0x192
+#define ICEMEM_SLAVE_TPKEY_SLOT	0x92
 #define KM_MASTER_TPKEY_SLOT	10
 #define BYTE_ORDER_VAL		8
-
-#define qti_hwkm_readl(hwkm, reg, dest)				\
-	(((dest) == KM_MASTER) ?				\
-	(readl_relaxed((void __iomem *)((hwkm)->km_base + (reg)))) :	\
-	(readl_relaxed((void __iomem *)((hwkm)->ice_hwkm_mmio + (reg)))))
-#define qti_hwkm_writel(hwkm, val, reg, dest)			\
-	(((dest) == KM_MASTER) ?				\
-	(writel_relaxed((val), (void __iomem *)((hwkm)->km_base + (reg)))) :\
-	(writel_relaxed((val), (void __iomem *)((hwkm)->ice_hwkm_mmio + (reg)))))
-#define qti_hwkm_setb(hwkm, reg, nr, dest) {			\
-	u32 val = qti_hwkm_readl(hwkm, reg, dest);		\
-	val |= (0x1 << nr);					\
-	qti_hwkm_writel(hwkm, val, reg, dest);			\
-}
-#define qti_hwkm_clearb(hwkm, reg, nr, dest) {			\
-	u32 val = qti_hwkm_readl(hwkm, reg, dest);		\
-	val &= ~(0x1 << nr);					\
-	qti_hwkm_writel(hwkm, val, reg, dest);			\
-}
 
 struct hwkm_clk_info {
 	struct list_head list;
@@ -76,38 +61,57 @@ struct hwkm_clk_info {
 	bool enabled;
 };
 
-static struct ice_mmio_data *mmio_data_ref;
+struct hwkm_device {
+	struct device *dev;
+	void __iomem *km_base;
+	void __iomem *ice_base;
+	struct resource *km_res;
+	struct resource *ice_res;
+	struct list_head clk_list_head;
+	bool is_hwkm_clk_available;
+	bool is_hwkm_enabled;
+};
 
-bool qti_hwkm_init_required(const struct ice_mmio_data *mmio_data)
-{
-	u32 val = 0;
+static struct hwkm_device *km_device;
 
-	val = qti_hwkm_readl(mmio_data,
-			QTI_HWKM_ICE_RG_TZ_KM_CTL, ICEMEM_SLAVE);
-	val = (val >> ICE_LEGACY_MODE_EN_OTP) & 0x1;
-	return (val == 1);
+#define qti_hwkm_readl(hwkm, reg, dest)				\
+	(((dest) == KM_MASTER) ?				\
+	(readl_relaxed((void __iomem *)((hwkm)->km_base + (reg)))) :	\
+	(readl_relaxed((void __iomem *)((hwkm)->ice_base + (reg)))))
+#define qti_hwkm_writel(hwkm, val, reg, dest)			\
+	(((dest) == KM_MASTER) ?				\
+	(writel_relaxed((val), (void __iomem *)((hwkm)->km_base + (reg)))) :\
+	(writel_relaxed((val), (void __iomem *)((hwkm)->ice_base + (reg)))))
+#define qti_hwkm_setb(hwkm, reg, nr, dest) {			\
+	u32 val = qti_hwkm_readl(hwkm, reg, dest);		\
+	val |= (0x1 << nr);					\
+	qti_hwkm_writel(hwkm, val, reg, dest);			\
 }
-EXPORT_SYMBOL(qti_hwkm_init_required);
-
-static inline unsigned int qti_hwkm_get_reg_data(struct ice_mmio_data *mmio_data,
-						 u32 reg, u32 offset, u32 mask,
-						 enum hwkm_destination dest)
-{
-	u32 val = 0;
-
-	val = qti_hwkm_readl(mmio_data, reg, dest);
-	return ((val & mask) >> offset);
+#define qti_hwkm_clearb(hwkm, reg, nr, dest) {			\
+	u32 val = qti_hwkm_readl(hwkm, reg, dest);		\
+	val &= ~(0x1 << nr);					\
+	qti_hwkm_writel(hwkm, val, reg, dest);			\
 }
 
-static inline bool qti_hwkm_testb(struct ice_mmio_data *mmio_data, u32 reg, u8 nr,
+static inline bool qti_hwkm_testb(struct hwkm_device *hwkm, u32 reg, u8 nr,
 				  enum hwkm_destination dest)
 {
-	u32 val = qti_hwkm_readl(mmio_data, reg, dest);
+	u32 val = qti_hwkm_readl(hwkm, reg, dest);
 
 	val = (val >> nr) & 0x1;
 	if (val == 0)
 		return false;
 	return true;
+}
+
+static inline unsigned int qti_hwkm_get_reg_data(struct hwkm_device *dev,
+						 u32 reg, u32 offset, u32 mask,
+						 enum hwkm_destination dest)
+{
+	u32 val = 0;
+
+	val = qti_hwkm_readl(dev, reg, dest);
+	return ((val & mask) >> offset);
 }
 
 /**
@@ -130,7 +134,7 @@ static inline bool qti_hwkm_testb(struct ice_mmio_data *mmio_data, u32 reg, u8 n
  * @return HWKM_SUCCESS if successful. HWKW Error Code otherwise.
  */
 
-static int qti_hwkm_master_transaction(struct ice_mmio_data *mmio_data,
+static int qti_hwkm_master_transaction(struct hwkm_device *dev,
 				       const uint32_t *cmd_packet,
 				       size_t cmd_words,
 				       uint32_t *rsp_packet,
@@ -142,31 +146,31 @@ static int qti_hwkm_master_transaction(struct ice_mmio_data *mmio_data,
 	uint32_t rsp_discard;
 
 	// Clear CMD FIFO
-	qti_hwkm_setb(mmio_data_ref, QTI_HWKM_MASTER_RG_BANK2_BANKN_CTL,
+	qti_hwkm_setb(dev, QTI_HWKM_MASTER_RG_BANK2_BANKN_CTL,
 			CMD_FIFO_CLEAR_BIT, KM_MASTER);
 	/* Write memory barrier */
 	wmb();
-	qti_hwkm_clearb(mmio_data_ref, QTI_HWKM_MASTER_RG_BANK2_BANKN_CTL,
+	qti_hwkm_clearb(dev, QTI_HWKM_MASTER_RG_BANK2_BANKN_CTL,
 			CMD_FIFO_CLEAR_BIT, KM_MASTER);
 	/* Write memory barrier */
 	wmb();
 
 	// Clear previous CMD errors, write 1 to err bits
-	val = qti_hwkm_readl(mmio_data_ref, QTI_HWKM_MASTER_RG_BANK2_BANKN_ESR,
+	val = qti_hwkm_readl(dev, QTI_HWKM_MASTER_RG_BANK2_BANKN_ESR,
 			KM_MASTER);
-	qti_hwkm_writel(mmio_data_ref, val,
+	qti_hwkm_writel(dev, val,
 			QTI_HWKM_MASTER_RG_BANK2_BANKN_ESR,
 			KM_MASTER);
 	/* Write memory barrier */
 	wmb();
 
 	// Enable command
-	qti_hwkm_setb(mmio_data_ref, QTI_HWKM_MASTER_RG_BANK2_BANKN_CTL, CMD_ENABLE_BIT,
+	qti_hwkm_setb(dev, QTI_HWKM_MASTER_RG_BANK2_BANKN_CTL, CMD_ENABLE_BIT,
 			KM_MASTER);
 	/* Write memory barrier */
 	wmb();
 
-	if (qti_hwkm_testb(mmio_data_ref, QTI_HWKM_MASTER_RG_BANK2_BANKN_CTL,
+	if (qti_hwkm_testb(dev, QTI_HWKM_MASTER_RG_BANK2_BANKN_CTL,
 			CMD_FIFO_CLEAR_BIT, KM_MASTER)) {
 
 		pr_err("%s: CMD_FIFO_CLEAR_BIT not set\n", __func__);
@@ -174,28 +178,28 @@ static int qti_hwkm_master_transaction(struct ice_mmio_data *mmio_data,
 		return -err;
 	}
 
-	if (qti_hwkm_testb(mmio_data_ref, QTI_HWKM_MASTER_RG_BANK2_BANKN_IRQ_STATUS,
+	if (qti_hwkm_testb(dev, QTI_HWKM_MASTER_RG_BANK2_BANKN_IRQ_STATUS,
 			RSP_FIFO_NOT_EMPTY, KM_MASTER)) {
-		while (qti_hwkm_get_reg_data(mmio_data_ref,
+		while (qti_hwkm_get_reg_data(dev,
 			QTI_HWKM_MASTER_RG_BANK2_BANKN_STATUS,
 			RSP_FIFO_AVAILABLE_DATA, RSP_FIFO_AVAILABLE_DATA_MASK,
 			KM_MASTER) > 0) {
-			rsp_discard = qti_hwkm_readl(mmio_data_ref,
+			rsp_discard = qti_hwkm_readl(dev,
 				QTI_HWKM_MASTER_RG_BANK2_RSP_0, KM_MASTER);
 		}
 		// Clear RSP_FIFO_NOT_EMPTY status bit
-		qti_hwkm_setb(mmio_data_ref, QTI_HWKM_MASTER_RG_BANK2_BANKN_IRQ_STATUS,
+		qti_hwkm_setb(dev, QTI_HWKM_MASTER_RG_BANK2_BANKN_IRQ_STATUS,
 			RSP_FIFO_NOT_EMPTY, KM_MASTER);
 		/* Write memory barrier */
 		wmb();
 	}
 
 	for (i = 0; i < cmd_words; i++) {
-		WAIT_UNTIL(qti_hwkm_get_reg_data(mmio_data_ref,
+		WAIT_UNTIL(qti_hwkm_get_reg_data(dev,
 			QTI_HWKM_MASTER_RG_BANK2_BANKN_STATUS,
 			CMD_FIFO_AVAILABLE_SPACE, CMD_FIFO_AVAILABLE_SPACE_MASK,
 			KM_MASTER) > 0);
-		if (qti_hwkm_get_reg_data(mmio_data_ref,
+		if (qti_hwkm_get_reg_data(dev,
 			QTI_HWKM_MASTER_RG_BANK2_BANKN_STATUS,
 			CMD_FIFO_AVAILABLE_SPACE, CMD_FIFO_AVAILABLE_SPACE_MASK,
 			KM_MASTER) == 0) {
@@ -203,18 +207,18 @@ static int qti_hwkm_master_transaction(struct ice_mmio_data *mmio_data,
 			err = -1;
 			return err;
 		}
-		qti_hwkm_writel(mmio_data_ref, cmd_packet[i],
+		qti_hwkm_writel(dev, cmd_packet[i],
 				QTI_HWKM_MASTER_RG_BANK2_CMD_0, KM_MASTER);
 		/* Write memory barrier */
 		wmb();
 	}
 
 	for (i = 0; i < rsp_words; i++) {
-		WAIT_UNTIL(qti_hwkm_get_reg_data(mmio_data_ref,
+		WAIT_UNTIL(qti_hwkm_get_reg_data(dev,
 			QTI_HWKM_MASTER_RG_BANK2_BANKN_STATUS,
 			RSP_FIFO_AVAILABLE_DATA, RSP_FIFO_AVAILABLE_DATA_MASK,
 			KM_MASTER) > 0);
-		if (qti_hwkm_get_reg_data(mmio_data_ref,
+		if (qti_hwkm_get_reg_data(dev,
 			QTI_HWKM_MASTER_RG_BANK2_BANKN_STATUS,
 			RSP_FIFO_AVAILABLE_DATA, RSP_FIFO_AVAILABLE_DATA_MASK,
 			KM_MASTER) == 0) {
@@ -222,11 +226,11 @@ static int qti_hwkm_master_transaction(struct ice_mmio_data *mmio_data,
 			err = -1;
 			return err;
 		}
-		rsp_packet[i] = qti_hwkm_readl(mmio_data_ref,
+		rsp_packet[i] = qti_hwkm_readl(dev,
 				QTI_HWKM_MASTER_RG_BANK2_RSP_0, KM_MASTER);
 	}
 
-	if (!qti_hwkm_testb(mmio_data_ref, QTI_HWKM_MASTER_RG_BANK2_BANKN_IRQ_STATUS,
+	if (!qti_hwkm_testb(dev, QTI_HWKM_MASTER_RG_BANK2_BANKN_IRQ_STATUS,
 			CMD_DONE_BIT, KM_MASTER)) {
 		pr_err("%s: CMD_DONE_BIT not set\n", __func__);
 		err = -1;
@@ -234,7 +238,7 @@ static int qti_hwkm_master_transaction(struct ice_mmio_data *mmio_data,
 	}
 
 	// Clear CMD_DONE status bit
-	qti_hwkm_setb(mmio_data_ref, QTI_HWKM_MASTER_RG_BANK2_BANKN_IRQ_STATUS,
+	qti_hwkm_setb(dev, QTI_HWKM_MASTER_RG_BANK2_BANKN_IRQ_STATUS,
 			CMD_DONE_BIT, KM_MASTER);
 	/* Write memory barrier */
 	wmb();
@@ -262,7 +266,7 @@ static int qti_hwkm_master_transaction(struct ice_mmio_data *mmio_data,
  * @return HWKM_SUCCESS if successful. HWKW Error Code otherwise.
  */
 
-static int qti_hwkm_ice_transaction(struct ice_mmio_data *mmio_data,
+static int qti_hwkm_ice_transaction(struct hwkm_device *dev,
 				    const uint32_t *cmd_packet,
 				    size_t cmd_words,
 				    uint32_t *rsp_packet,
@@ -274,19 +278,19 @@ static int qti_hwkm_ice_transaction(struct ice_mmio_data *mmio_data,
 	uint32_t rsp_discard;
 
 	// Clear CMD FIFO
-	qti_hwkm_setb(mmio_data, QTI_HWKM_ICE_RG_BANK0_BANKN_CTL,
+	qti_hwkm_setb(dev, QTI_HWKM_ICE_RG_BANK0_BANKN_CTL,
 			CMD_FIFO_CLEAR_BIT, ICEMEM_SLAVE);
 	/* Write memory barrier */
 	wmb();
-	qti_hwkm_clearb(mmio_data, QTI_HWKM_ICE_RG_BANK0_BANKN_CTL,
+	qti_hwkm_clearb(dev, QTI_HWKM_ICE_RG_BANK0_BANKN_CTL,
 			CMD_FIFO_CLEAR_BIT, ICEMEM_SLAVE);
 	/* Write memory barrier */
 	wmb();
 
 	// Clear previous CMD errors, write 1 to err bits
-	val = qti_hwkm_readl(mmio_data, QTI_HWKM_ICE_RG_BANK0_BANKN_ESR,
+	val = qti_hwkm_readl(dev, QTI_HWKM_ICE_RG_BANK0_BANKN_ESR,
 			ICEMEM_SLAVE);
-	qti_hwkm_writel(mmio_data, val,
+	qti_hwkm_writel(dev, val,
 			QTI_HWKM_ICE_RG_BANK0_BANKN_ESR,
 			ICEMEM_SLAVE);
 
@@ -294,12 +298,12 @@ static int qti_hwkm_ice_transaction(struct ice_mmio_data *mmio_data,
 	wmb();
 
 	// Enable command
-	qti_hwkm_setb(mmio_data, QTI_HWKM_ICE_RG_BANK0_BANKN_CTL, CMD_ENABLE_BIT,
+	qti_hwkm_setb(dev, QTI_HWKM_ICE_RG_BANK0_BANKN_CTL, CMD_ENABLE_BIT,
 			ICEMEM_SLAVE);
 	/* Write memory barrier */
 	wmb();
 
-	if (qti_hwkm_testb(mmio_data, QTI_HWKM_ICE_RG_BANK0_BANKN_CTL,
+	if (qti_hwkm_testb(dev, QTI_HWKM_ICE_RG_BANK0_BANKN_CTL,
 			CMD_FIFO_CLEAR_BIT, ICEMEM_SLAVE)) {
 
 		pr_err("%s: CMD_FIFO_CLEAR_BIT not set\n", __func__);
@@ -307,29 +311,28 @@ static int qti_hwkm_ice_transaction(struct ice_mmio_data *mmio_data,
 		return err;
 	}
 
-	if (qti_hwkm_testb(mmio_data, QTI_HWKM_ICE_RG_BANK0_BANKN_IRQ_STATUS,
+	if (qti_hwkm_testb(dev, QTI_HWKM_ICE_RG_BANK0_BANKN_IRQ_STATUS,
 			RSP_FIFO_NOT_EMPTY, ICEMEM_SLAVE)) {
-		while (qti_hwkm_get_reg_data(mmio_data,
+		while (qti_hwkm_get_reg_data(dev,
 			QTI_HWKM_ICE_RG_BANK0_BANKN_STATUS,
 			RSP_FIFO_AVAILABLE_DATA, RSP_FIFO_AVAILABLE_DATA_MASK,
 			ICEMEM_SLAVE) > 0) {
-			rsp_discard = qti_hwkm_readl(mmio_data,
+			rsp_discard = qti_hwkm_readl(dev,
 				QTI_HWKM_ICE_RG_BANK0_RSP_0, ICEMEM_SLAVE);
 		}
-		pr_err("%s: while exit\n", __func__);
 		// Clear RSP_FIFO_NOT_EMPTY status bit
-		qti_hwkm_setb(mmio_data, QTI_HWKM_ICE_RG_BANK0_BANKN_IRQ_STATUS,
+		qti_hwkm_setb(dev, QTI_HWKM_ICE_RG_BANK0_BANKN_IRQ_STATUS,
 			RSP_FIFO_NOT_EMPTY, ICEMEM_SLAVE);
 		/* Write memory barrier */
 		wmb();
 	}
 
 	for (i = 0; i < cmd_words; i++) {
-		WAIT_UNTIL(qti_hwkm_get_reg_data(mmio_data,
+		WAIT_UNTIL(qti_hwkm_get_reg_data(dev,
 			QTI_HWKM_ICE_RG_BANK0_BANKN_STATUS,
 			CMD_FIFO_AVAILABLE_SPACE, CMD_FIFO_AVAILABLE_SPACE_MASK,
 			ICEMEM_SLAVE) > 0);
-		if (qti_hwkm_get_reg_data(mmio_data,
+		if (qti_hwkm_get_reg_data(dev,
 			QTI_HWKM_ICE_RG_BANK0_BANKN_STATUS,
 			CMD_FIFO_AVAILABLE_SPACE, CMD_FIFO_AVAILABLE_SPACE_MASK,
 			ICEMEM_SLAVE) == 0) {
@@ -337,18 +340,18 @@ static int qti_hwkm_ice_transaction(struct ice_mmio_data *mmio_data,
 			err = -1;
 			return err;
 		}
-		qti_hwkm_writel(mmio_data, cmd_packet[i],
+		qti_hwkm_writel(dev, cmd_packet[i],
 				QTI_HWKM_ICE_RG_BANK0_CMD_0, ICEMEM_SLAVE);
 		/* Write memory barrier */
 		wmb();
 	}
 
 	for (i = 0; i < rsp_words; i++) {
-		WAIT_UNTIL(qti_hwkm_get_reg_data(mmio_data,
+		WAIT_UNTIL(qti_hwkm_get_reg_data(dev,
 			QTI_HWKM_ICE_RG_BANK0_BANKN_STATUS,
 			RSP_FIFO_AVAILABLE_DATA, RSP_FIFO_AVAILABLE_DATA_MASK,
 			ICEMEM_SLAVE) > 0);
-		if (qti_hwkm_get_reg_data(mmio_data,
+		if (qti_hwkm_get_reg_data(dev,
 			QTI_HWKM_ICE_RG_BANK0_BANKN_STATUS,
 			RSP_FIFO_AVAILABLE_DATA, RSP_FIFO_AVAILABLE_DATA_MASK,
 			ICEMEM_SLAVE) == 0) {
@@ -356,11 +359,11 @@ static int qti_hwkm_ice_transaction(struct ice_mmio_data *mmio_data,
 			err = -1;
 			return err;
 		}
-		rsp_packet[i] = qti_hwkm_readl(mmio_data,
+		rsp_packet[i] = qti_hwkm_readl(dev,
 				QTI_HWKM_ICE_RG_BANK0_RSP_0, ICEMEM_SLAVE);
 	}
 
-	if (!qti_hwkm_testb(mmio_data, QTI_HWKM_ICE_RG_BANK0_BANKN_IRQ_STATUS,
+	if (!qti_hwkm_testb(dev, QTI_HWKM_ICE_RG_BANK0_BANKN_IRQ_STATUS,
 			CMD_DONE_BIT, ICEMEM_SLAVE)) {
 		pr_err("%s: CMD_DONE_BIT not set\n", __func__);
 		err = -1;
@@ -368,7 +371,7 @@ static int qti_hwkm_ice_transaction(struct ice_mmio_data *mmio_data,
 	}
 
 	// Clear CMD_DONE status bit
-	qti_hwkm_setb(mmio_data, QTI_HWKM_ICE_RG_BANK0_BANKN_IRQ_STATUS,
+	qti_hwkm_setb(dev, QTI_HWKM_ICE_RG_BANK0_BANKN_IRQ_STATUS,
 			CMD_DONE_BIT, ICEMEM_SLAVE);
 	/* Write memory barrier */
 	wmb();
@@ -389,8 +392,7 @@ static int qti_hwkm_ice_transaction(struct ice_mmio_data *mmio_data,
  * @return HWKM_SUCCESS if successful. HWKW Error Code otherwise.
  */
 
-static int qti_hwkm_run_transaction(struct ice_mmio_data *mmio_data,
-					enum hwkm_destination dest,
+static int qti_hwkm_run_transaction(enum hwkm_destination dest,
 				    const uint32_t *cmd_packet,
 				    size_t cmd_words,
 				    uint32_t *rsp_packet,
@@ -405,12 +407,12 @@ static int qti_hwkm_run_transaction(struct ice_mmio_data *mmio_data,
 
 	switch (dest) {
 	case KM_MASTER:
-		status = qti_hwkm_master_transaction(mmio_data,
+		status = qti_hwkm_master_transaction(km_device,
 					cmd_packet, cmd_words,
 					rsp_packet, rsp_words);
 		break;
 	case ICEMEM_SLAVE:
-		status = qti_hwkm_ice_transaction(mmio_data,
+		status = qti_hwkm_ice_transaction(km_device,
 					cmd_packet, cmd_words,
 					rsp_packet, rsp_words);
 		break;
@@ -478,6 +480,7 @@ static void deserialize_policy(struct hwkm_key_policy *out,
 	out->km_by_spu_allowed = policy->key_management_by_spu_allowed;
 }
 
+
 static void reverse_bytes(u8 *bytes, size_t len)
 {
 	size_t left = 0;
@@ -523,8 +526,7 @@ static void reorder_ctx(u8 *ctx, size_t ctxlen)
  * RSP[1]    = Error status
  */
 
-static int qti_handle_key_unwrap_import(struct ice_mmio_data *mmio_data,
-					const struct hwkm_cmd *cmd_in,
+static int qti_handle_key_unwrap_import(const struct hwkm_cmd *cmd_in,
 					struct hwkm_rsp *rsp_in)
 {
 	int status = 0;
@@ -563,7 +565,7 @@ static int qti_handle_key_unwrap_import(struct ice_mmio_data *mmio_data,
 	memcpy(cmd + COMMAND_WRAPPED_KEY_IDX, cmd_in->unwrap.wkb,
 			cmd_in->unwrap.sz);
 
-	status = qti_hwkm_run_transaction(mmio_data, ICEMEM_SLAVE, cmd,
+	status = qti_hwkm_run_transaction(ICEMEM_SLAVE, cmd,
 			UNWRAP_IMPORT_CMD_WORDS, rsp, UNWRAP_IMPORT_RSP_WORDS);
 	if (status) {
 		pr_err("%s: Error running transaction %d\n", __func__, status);
@@ -590,7 +592,7 @@ static int qti_handle_key_unwrap_import(struct ice_mmio_data *mmio_data,
  * RSP[1] = Error status
  */
 
-static int qti_handle_keyslot_clear(struct ice_mmio_data *mmio_data, const struct hwkm_cmd *cmd_in,
+static int qti_handle_keyslot_clear(const struct hwkm_cmd *cmd_in,
 				    struct hwkm_rsp *rsp_in)
 {
 	int status = 0;
@@ -607,7 +609,8 @@ static int qti_handle_keyslot_clear(struct ice_mmio_data *mmio_data, const struc
 	pr_debug("%s: KEY_SLOT_CLEAR start\n", __func__);
 
 	memcpy(cmd, &operation, OPERATION_INFO_LENGTH);
-	status = qti_hwkm_run_transaction(mmio_data, ICEMEM_SLAVE, cmd,
+
+	status = qti_hwkm_run_transaction(ICEMEM_SLAVE, cmd,
 				KEYSLOT_CLEAR_CMD_WORDS, rsp,
 				KEYSLOT_CLEAR_RSP_WORDS);
 	if (status) {
@@ -616,8 +619,9 @@ static int qti_handle_keyslot_clear(struct ice_mmio_data *mmio_data, const struc
 	}
 
 	rsp_in->status = rsp[RESPONSE_ERR_IDX];
-	if (rsp_in->status)
+	if (rsp_in->status) {
 		return rsp_in->status;
+	}
 
 	return status;
 }
@@ -643,7 +647,7 @@ static int qti_handle_keyslot_clear(struct ice_mmio_data *mmio_data, const struc
  * RSP[1]    = Error status
  */
 
-static int qti_handle_system_kdf(struct ice_mmio_data *mmio_data, const struct hwkm_cmd *cmd_in,
+static int qti_handle_system_kdf(const struct hwkm_cmd *cmd_in,
 				 struct hwkm_rsp *rsp_in)
 {
 	int status = 0;
@@ -696,7 +700,7 @@ static int qti_handle_system_kdf(struct ice_mmio_data *mmio_data, const struct h
 	reorder_ctx((u8 *) cmd_in->kdf.ctx, cmd_in->kdf.sz);
 	WRITE_TO_KDF_PACKET(cmd_ptr, cmd_in->kdf.ctx, cmd_in->kdf.sz);
 
-	status = qti_hwkm_run_transaction(mmio_data, ICEMEM_SLAVE, cmd,
+	status = qti_hwkm_run_transaction(ICEMEM_SLAVE, cmd,
 				operation.len + operation.context_len,
 				rsp, SYSTEM_KDF_RSP_WORDS);
 	if (status) {
@@ -724,7 +728,7 @@ static int qti_handle_system_kdf(struct ice_mmio_data *mmio_data, const struct h
  * RSP[1] = Error status
  */
 
-static int qti_handle_set_tpkey(struct ice_mmio_data *mmio_data, const struct hwkm_cmd *cmd_in,
+static int qti_handle_set_tpkey(const struct hwkm_cmd *cmd_in,
 				struct hwkm_rsp *rsp_in)
 {
 	int status = 0;
@@ -741,7 +745,7 @@ static int qti_handle_set_tpkey(struct ice_mmio_data *mmio_data, const struct hw
 
 	memcpy(cmd, &operation, OPERATION_INFO_LENGTH);
 
-	status = qti_hwkm_run_transaction(mmio_data, KM_MASTER, cmd,
+	status = qti_hwkm_run_transaction(KM_MASTER, cmd,
 			SET_TPKEY_CMD_WORDS, rsp, SET_TPKEY_RSP_WORDS);
 	if (status) {
 		pr_err("%s: Error running transaction %d\n", __func__, status);
@@ -789,7 +793,7 @@ static int qti_handle_set_tpkey(struct ice_mmio_data *mmio_data, const struct hw
  * RSP[4:11] = Read key value (0 if we == 1)
  **/
 
-static int qti_handle_keyslot_rdwr(struct ice_mmio_data *mmio_data, const struct hwkm_cmd *cmd_in,
+static int qti_handle_keyslot_rdwr(const struct hwkm_cmd *cmd_in,
 				   struct hwkm_rsp *rsp_in)
 {
 	int status = 0;
@@ -819,7 +823,7 @@ static int qti_handle_keyslot_rdwr(struct ice_mmio_data *mmio_data, const struct
 				HWKM_MAX_KEY_SIZE);
 	}
 
-	status = qti_hwkm_run_transaction(mmio_data, ICEMEM_SLAVE, cmd,
+	status = qti_hwkm_run_transaction(ICEMEM_SLAVE, cmd,
 			KEYSLOT_RDWR_CMD_WORDS, rsp, KEYSLOT_RDWR_RSP_WORDS);
 	if (status) {
 		pr_err("%s: Error running transaction %d\n", __func__, status);
@@ -854,7 +858,7 @@ static int qti_handle_keyslot_rdwr(struct ice_mmio_data *mmio_data, const struct
 }
 
 static int qti_hwkm_parse_clock_info(struct platform_device *pdev,
-				     struct ice_mmio_data *hwkm_dev)
+				     struct hwkm_device *hwkm_dev)
 {
 	int ret = -1, cnt, i, len;
 	struct device *dev = &pdev->dev;
@@ -911,7 +915,7 @@ out:
 	return ret;
 }
 
-static int qti_hwkm_init_clocks(struct ice_mmio_data *hwkm_dev)
+static int qti_hwkm_init_clocks(struct hwkm_device *hwkm_dev)
 {
 	int ret = -EINVAL;
 	struct hwkm_clk_info *clki = NULL;
@@ -956,7 +960,7 @@ out:
 	return ret;
 }
 
-static int qti_hwkm_enable_disable_clocks(struct ice_mmio_data *hwkm_dev,
+static int qti_hwkm_enable_disable_clocks(struct hwkm_device *hwkm_dev,
 					  bool enable)
 {
 	int ret = 0;
@@ -999,10 +1003,10 @@ int qti_hwkm_clocks(bool on)
 {
 	int ret = 0;
 
-	ret = qti_hwkm_enable_disable_clocks(mmio_data_ref, on);
+	ret = qti_hwkm_enable_disable_clocks(km_device, on);
 	if (ret) {
 		pr_err("%s:%pK Could not enable/disable clocks\n",
-				__func__, mmio_data_ref);
+				__func__, km_device);
 	}
 
 	return ret;
@@ -1010,7 +1014,7 @@ int qti_hwkm_clocks(bool on)
 EXPORT_SYMBOL(qti_hwkm_clocks);
 
 static int qti_hwkm_get_device_tree_data(struct platform_device *pdev,
-					 struct ice_mmio_data *hwkm_dev)
+					 struct hwkm_device *hwkm_dev)
 {
 	struct device *dev = &pdev->dev;
 	int ret = 0;
@@ -1050,16 +1054,16 @@ out:
 int qti_hwkm_handle_cmd(struct hwkm_cmd *cmd, struct hwkm_rsp *rsp)
 {
 	switch (cmd->op) {
-	case SET_TPKEY:
-		return qti_handle_set_tpkey(mmio_data_ref, cmd, rsp);
-	case KEY_UNWRAP_IMPORT:
-		return qti_handle_key_unwrap_import(mmio_data_ref, cmd, rsp);
-	case KEY_SLOT_CLEAR:
-		return qti_handle_keyslot_clear(mmio_data_ref, cmd, rsp);
-	case KEY_SLOT_RDWR:
-		return qti_handle_keyslot_rdwr(mmio_data_ref, cmd, rsp);
 	case SYSTEM_KDF:
-		return qti_handle_system_kdf(mmio_data_ref, cmd, rsp);
+		return qti_handle_system_kdf(cmd, rsp);
+	case KEY_UNWRAP_IMPORT:
+		return qti_handle_key_unwrap_import(cmd, rsp);
+	case KEY_SLOT_CLEAR:
+		return qti_handle_keyslot_clear(cmd, rsp);
+	case KEY_SLOT_RDWR:
+		return qti_handle_keyslot_rdwr(cmd, rsp);
+	case SET_TPKEY:
+		return qti_handle_set_tpkey(cmd, rsp);
 	case NIST_KEYGEN:
 	case KEY_WRAP_EXPORT:
 	case QFPROM_KEY_RDWR: // cmd for HW initialization cmd only
@@ -1071,47 +1075,47 @@ int qti_hwkm_handle_cmd(struct hwkm_cmd *cmd, struct hwkm_rsp *rsp)
 }
 EXPORT_SYMBOL(qti_hwkm_handle_cmd);
 
-static void qti_hwkm_configure_slot_access(struct ice_mmio_data *mmio_data)
+static void qti_hwkm_configure_slot_access(struct hwkm_device *dev)
 {
-	qti_hwkm_writel(mmio_data, 0xffffffff,
+	qti_hwkm_writel(dev, 0xffffffff,
 		QTI_HWKM_ICE_RG_BANK0_AC_BANKN_BBAC_0, ICEMEM_SLAVE);
-	qti_hwkm_writel(mmio_data, 0xffffffff,
+	qti_hwkm_writel(dev, 0xffffffff,
 		QTI_HWKM_ICE_RG_BANK0_AC_BANKN_BBAC_1, ICEMEM_SLAVE);
-	qti_hwkm_writel(mmio_data, 0xffffffff,
+	qti_hwkm_writel(dev, 0xffffffff,
 		QTI_HWKM_ICE_RG_BANK0_AC_BANKN_BBAC_2, ICEMEM_SLAVE);
-	qti_hwkm_writel(mmio_data, 0xffffffff,
+	qti_hwkm_writel(dev, 0xffffffff,
 		QTI_HWKM_ICE_RG_BANK0_AC_BANKN_BBAC_3, ICEMEM_SLAVE);
-	qti_hwkm_writel(mmio_data, 0xffffffff,
+	qti_hwkm_writel(dev, 0xffffffff,
 		QTI_HWKM_ICE_RG_BANK0_AC_BANKN_BBAC_4, ICEMEM_SLAVE);
 }
 
-static int qti_hwkm_check_bist_status(struct ice_mmio_data *mmio_data)
+static int qti_hwkm_check_bist_status(struct hwkm_device *hwkm_dev)
 {
-	if (!qti_hwkm_testb(mmio_data, QTI_HWKM_ICE_RG_TZ_KM_STATUS,
+	if (!qti_hwkm_testb(hwkm_dev, QTI_HWKM_ICE_RG_TZ_KM_STATUS,
 		BIST_DONE, ICEMEM_SLAVE)) {
 		pr_err("%s: Error with BIST_DONE\n", __func__);
 		return -EINVAL;
 	}
 
-	if (!qti_hwkm_testb(mmio_data, QTI_HWKM_ICE_RG_TZ_KM_STATUS,
+	if (!qti_hwkm_testb(hwkm_dev, QTI_HWKM_ICE_RG_TZ_KM_STATUS,
 		CRYPTO_LIB_BIST_DONE, ICEMEM_SLAVE)) {
 		pr_err("%s: Error with CRYPTO_LIB_BIST_DONE\n", __func__);
 		return -EINVAL;
 	}
 
-	if (!qti_hwkm_testb(mmio_data, QTI_HWKM_ICE_RG_TZ_KM_STATUS,
+	if (!qti_hwkm_testb(hwkm_dev, QTI_HWKM_ICE_RG_TZ_KM_STATUS,
 		BOOT_CMD_LIST1_DONE, ICEMEM_SLAVE)) {
 		pr_err("%s: Error with BOOT_CMD_LIST1_DONE\n", __func__);
 		return -EINVAL;
 	}
 
-	if (!qti_hwkm_testb(mmio_data, QTI_HWKM_ICE_RG_TZ_KM_STATUS,
+	if (!qti_hwkm_testb(hwkm_dev, QTI_HWKM_ICE_RG_TZ_KM_STATUS,
 		BOOT_CMD_LIST0_DONE, ICEMEM_SLAVE)) {
 		pr_err("%s: Error with BOOT_CMD_LIST0_DONE\n", __func__);
 		return -EINVAL;
 	}
 
-	if (!qti_hwkm_testb(mmio_data, QTI_HWKM_ICE_RG_TZ_KM_STATUS,
+	if (!qti_hwkm_testb(hwkm_dev, QTI_HWKM_ICE_RG_TZ_KM_STATUS,
 		KT_CLEAR_DONE, ICEMEM_SLAVE)) {
 		pr_err("%s: KT_CLEAR_DONE\n", __func__);
 		return -EINVAL;
@@ -1120,35 +1124,34 @@ static int qti_hwkm_check_bist_status(struct ice_mmio_data *mmio_data)
 	return 0;
 }
 
-static int qti_hwkm_ice_init_sequence(struct ice_mmio_data *mmio_data)
+static int qti_hwkm_ice_init_sequence(struct hwkm_device *hwkm_dev)
 {
 	int ret = 0;
 
-	//Put ICE in standard mode
-	qti_hwkm_writel(mmio_data, 0x7, QTI_HWKM_ICE_RG_TZ_KM_CTL, ICEMEM_SLAVE);
+	// Put ICE in standard mode
+	qti_hwkm_writel(hwkm_dev, 0x7, QTI_HWKM_ICE_RG_TZ_KM_CTL, ICEMEM_SLAVE);
 	/* Write memory barrier */
 	wmb();
 
-	ret = qti_hwkm_check_bist_status(mmio_data);
+	ret = qti_hwkm_check_bist_status(hwkm_dev);
 	if (ret) {
 		pr_err("%s: Error in BIST initialization %d\n", __func__, ret);
 		return ret;
 	}
 
 	// Disable CRC checks
-	qti_hwkm_clearb(mmio_data, QTI_HWKM_ICE_RG_TZ_KM_CTL,
-				CRC_CHECK_EN, ICEMEM_SLAVE);
+	qti_hwkm_clearb(hwkm_dev, QTI_HWKM_ICE_RG_TZ_KM_CTL, CRC_CHECK_EN,
+			ICEMEM_SLAVE);
 	/* Write memory barrier */
 	wmb();
 
 	// Configure key slots to be accessed by HLOS
-	qti_hwkm_configure_slot_access(mmio_data);
+	qti_hwkm_configure_slot_access(hwkm_dev);
 	/* Write memory barrier */
 	wmb();
 
 	// Clear RSP_FIFO_FULL bit
-	qti_hwkm_setb(mmio_data,
-			QTI_HWKM_ICE_RG_BANK0_BANKN_IRQ_STATUS,
+	qti_hwkm_setb(hwkm_dev, QTI_HWKM_ICE_RG_BANK0_BANKN_IRQ_STATUS,
 			RSP_FIFO_FULL, ICEMEM_SLAVE);
 	/* Write memory barrier */
 	wmb();
@@ -1156,96 +1159,88 @@ static int qti_hwkm_ice_init_sequence(struct ice_mmio_data *mmio_data)
 	return ret;
 }
 
-static void qti_hwkm_enable_slave_receive_mode(
-					const struct ice_mmio_data *mmio_data)
+static void qti_hwkm_enable_slave_receive_mode(struct hwkm_device *hwkm_dev)
 {
-	qti_hwkm_clearb(mmio_data,
-			QTI_HWKM_ICE_RG_TZ_TPKEY_RECEIVE_CTL, TPKEY_EN, ICEMEM_SLAVE);
+	qti_hwkm_clearb(hwkm_dev, QTI_HWKM_ICE_RG_TZ_TPKEY_RECEIVE_CTL,
+			TPKEY_EN, ICEMEM_SLAVE);
 	/* Write memory barrier */
 	wmb();
-	qti_hwkm_writel(mmio_data, ICEMEM_SLAVE_TPKEY_VAL,
+	qti_hwkm_writel(hwkm_dev, ICEMEM_SLAVE_TPKEY_VAL,
 			QTI_HWKM_ICE_RG_TZ_TPKEY_RECEIVE_CTL, ICEMEM_SLAVE);
 	/* Write memory barrier */
 	wmb();
 }
 
-static void qti_hwkm_disable_slave_receive_mode(
-					struct ice_mmio_data *mmio_data)
+static void qti_hwkm_disable_slave_receive_mode(struct hwkm_device *hwkm_dev)
 {
-	qti_hwkm_clearb(mmio_data,
-			QTI_HWKM_ICE_RG_TZ_TPKEY_RECEIVE_CTL, TPKEY_EN, ICEMEM_SLAVE);
+	qti_hwkm_clearb(hwkm_dev, QTI_HWKM_ICE_RG_TZ_TPKEY_RECEIVE_CTL,
+			TPKEY_EN, ICEMEM_SLAVE);
 	/* Write memory barrier */
 	wmb();
 }
 
-static void qti_hwkm_check_tpkey_status(struct ice_mmio_data *mmio_data)
+static void qti_hwkm_check_tpkey_status(struct hwkm_device *hwkm_dev)
 {
 	int val = 0;
 
-	val = qti_hwkm_readl(mmio_data,
-			QTI_HWKM_ICE_RG_TZ_TPKEY_RECEIVE_STATUS, ICEMEM_SLAVE);
+	val = qti_hwkm_readl(hwkm_dev, QTI_HWKM_ICE_RG_TZ_TPKEY_RECEIVE_STATUS,
+			ICEMEM_SLAVE);
 
 	pr_debug("%s: Tpkey receive status 0x%x\n", __func__, val);
 }
 
-static int qti_hwkm_set_tpkey(struct ice_mmio_data *mmio_data)
+static int qti_hwkm_set_tpkey(void)
 {
-	int err = 0;
-	struct hwkm_cmd cmd_settpkey = {0};
-	struct hwkm_rsp rsp_settpkey = {0};
+	int ret = 0;
+	struct hwkm_cmd cmd;
+	struct hwkm_rsp rsp;
 
-	cmd_settpkey.op = SET_TPKEY;
-	cmd_settpkey.set_tpkey.sks = KM_MASTER_TPKEY_SLOT;
+	cmd.op = SET_TPKEY;
+	cmd.set_tpkey.sks = KM_MASTER_TPKEY_SLOT;
 
-	qti_hwkm_enable_slave_receive_mode(mmio_data);
-	err = qti_hwkm_handle_cmd(&cmd_settpkey, &rsp_settpkey);
-	if (err) {
-		pr_err("%s: Error with Set TP key in master %d\n", __func__,
-							err);
-		return -EINVAL;
+	qti_hwkm_enable_slave_receive_mode(km_device);
+	ret = qti_hwkm_handle_cmd(&cmd, &rsp);
+	if (ret) {
+		pr_err("%s: Error running commands\n", __func__, ret);
+		return ret;
 	}
 
-	qti_hwkm_check_tpkey_status(mmio_data);
-	qti_hwkm_disable_slave_receive_mode(mmio_data);
+	qti_hwkm_check_tpkey_status(km_device);
+	qti_hwkm_disable_slave_receive_mode(km_device);
 
 	return 0;
 }
 
-int qti_hwkm_init(const struct ice_mmio_data *mmio_data)
+int qti_hwkm_init(void __iomem *hwkm_slave_mmio_base)
 {
 	int ret = 0;
 
-	pr_debug("%s %d: HWKM init starts\n", __func__, __LINE__);
-	if (!mmio_data->ice_hwkm_mmio || !mmio_data->ice_base_mmio) {
+	if (!hwkm_slave_mmio_base) {
 		pr_err("%s: HWKM ICE slave mmio invalid\n", __func__);
 		return -EINVAL;
 	}
+	km_device->ice_base = hwkm_slave_mmio_base;
 
-	mmio_data_ref->ice_hwkm_mmio = mmio_data->ice_hwkm_mmio;
-	mmio_data_ref->ice_base_mmio = mmio_data->ice_base_mmio;
-
-	ret = qti_hwkm_ice_init_sequence(mmio_data_ref);
+	ret = qti_hwkm_ice_init_sequence(km_device);
 	if (ret) {
 		pr_err("%s: Error in ICE init sequence %d\n", __func__, ret);
 		return ret;
 	}
 
-	ret = qti_hwkm_set_tpkey(mmio_data_ref);
+	ret = qti_hwkm_set_tpkey();
 	if (ret) {
 		pr_err("%s: Error setting ICE to receive %d\n", __func__, ret);
 		return ret;
 	}
 	/* Write memory barrier */
 	wmb();
-
-	pr_debug("%s %d: HWKM init ends\n", __func__, __LINE__);
 	return ret;
 }
 EXPORT_SYMBOL(qti_hwkm_init);
 
 static int qti_hwkm_probe(struct platform_device *pdev)
 {
-	struct ice_mmio_data *hwkm_dev;
+	struct hwkm_device *hwkm_dev;
 	int ret = 0;
 
 	pr_debug("%s %d: HWKM probe start\n", __func__, __LINE__);
@@ -1254,7 +1249,7 @@ static int qti_hwkm_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
-	hwkm_dev = kzalloc(sizeof(struct ice_mmio_data), GFP_KERNEL);
+	hwkm_dev = kzalloc(sizeof(struct hwkm_device), GFP_KERNEL);
 	if (!hwkm_dev) {
 		ret = -ENOMEM;
 		pr_err("%s: Error %d allocating memory for HWKM device\n",
@@ -1286,21 +1281,22 @@ static int qti_hwkm_probe(struct platform_device *pdev)
 	}
 
 	hwkm_dev->is_hwkm_enabled = true;
-	mmio_data_ref = hwkm_dev;
+	km_device = hwkm_dev;
 	platform_set_drvdata(pdev, hwkm_dev);
 
-	pr_err("%s %d:HWKM probe ends\n", __func__, __LINE__);
+	pr_debug("%s %d: HWKM probe ends\n", __func__, __LINE__);
 	return ret;
 
 err_hwkm_dev:
-	mmio_data_ref = NULL;
+	km_device = NULL;
 	kfree(hwkm_dev);
 	return ret;
 }
 
+
 static int qti_hwkm_remove(struct platform_device *pdev)
 {
-	kfree(mmio_data_ref);
+	kfree(km_device);
 	return 0;
 }
 
@@ -1314,11 +1310,11 @@ static struct platform_driver qti_hwkm_driver = {
 	.probe		= qti_hwkm_probe,
 	.remove		= qti_hwkm_remove,
 	.driver		= {
-		.name		= "qti_hwkm",
+		.name	= "qti_hwkm",
 		.of_match_table	= qti_hwkm_match,
 	},
 };
 module_platform_driver(qti_hwkm_driver);
 
 MODULE_LICENSE("GPL v2");
-MODULE_DESCRIPTION("QTI Hardware Key Manager library");
+MODULE_DESCRIPTION("QTI Hardware Key Manager driver");
