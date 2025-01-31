@@ -104,13 +104,10 @@ void __bio_crypt_free_ctx(struct bio *bio)
 	bio->bi_crypt_context = NULL;
 }
 
-int __bio_crypt_clone(struct bio *dst, struct bio *src, gfp_t gfp_mask)
+void __bio_crypt_clone(struct bio *dst, struct bio *src, gfp_t gfp_mask)
 {
 	dst->bi_crypt_context = mempool_alloc(bio_crypt_ctx_pool, gfp_mask);
-	if (!dst->bi_crypt_context)
-		return -ENOMEM;
 	*dst->bi_crypt_context = *src->bi_crypt_context;
-	return 0;
 }
 EXPORT_SYMBOL_GPL(__bio_crypt_clone);
 
