@@ -19,9 +19,21 @@ ifneq ($(shell grep -q "int path_umount" $(srctree)/fs/namespace.c; echo $$?),0)
 $(error -- No path_umount detected !! Read: https://kernelsu.org/guide/how-to-integrate-for-non-gki.html#how-to-backport-path-umount)
 endif
 
+# GKI manual hook checks
+# https://github.com/Pzqqt/android_kernel_xiaomi_marble/commit/5b8596b5604bcd0e6e12697a01136a0bb9eb0257
+ifeq ($(CONFIG_KSU_MANUAL_HOOK),y)
+ifeq ($(CONFIG_KSU),m)
+$(error CONFIG_KSU_MANUAL_HOOK cannot be enabled when compiling KernelSU as LKM!)
+endif
+else
+ifeq ($(CONFIG_KPROBES),y)
+ccflags-y += -DKSU_HOOK_WITH_KPROBES
+endif
+endif
+
 obj-$(CONFIG_KSU) += kernelsu.o
 
-ccflags-y += -DKSU_VERSION=12034
+ccflags-y += -DKSU_VERSION=12055
 
 ifeq ($(shell grep -q " current_sid(void)" $(srctree)/security/selinux/include/objsec.h; echo $$?),0)
 ccflags-y += -DKSU_COMPAT_HAS_CURRENT_SID
@@ -42,6 +54,18 @@ ccflags-y += -DKSU_COMPAT_LONG_INC
 else
 $(info -- KernelSU compat: atomic_t detected.)
 endif
+endif
+
+ifeq ($(shell grep -q "strncpy_from_user_nofault" $(srctree)/include/linux/uaccess.h; echo $$?),0)
+ccflags-y += -DKSU_STRNCPY_FROM_USER_NOFAULT
+endif
+
+ifeq ($(shell grep -q "ssize_t kernel_read" $(srctree)/fs/read_write.c; echo $$?),0)
+ccflags-y += -DKSU_KERNEL_READ
+endif
+
+ifeq ($(shell grep "ssize_t kernel_write" $(srctree)/fs/read_write.c | grep -q "const void" ; echo $$?),0)
+ccflags-y += -DKSU_KERNEL_WRITE
 endif
 
 ifndef KSU_EXPECTED_SIZE
