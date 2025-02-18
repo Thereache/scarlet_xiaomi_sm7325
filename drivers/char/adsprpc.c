@@ -4860,7 +4860,7 @@ static int fastrpc_internal_munmap(struct fastrpc_file *fl,
 			"user application %s trying to unmap without initialization\n",
 			current->comm);
 		err = -EHOSTDOWN;
-		return err;
+		goto bail;
 	}
 	mutex_lock(&fl->internal_map_mutex);
 
