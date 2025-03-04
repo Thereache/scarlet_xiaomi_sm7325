@@ -2905,9 +2905,9 @@ static int __init goodix_ts_core_init(void)
 	gpio_68 = gpio_get_value(DISP_ID1_DET);
 
 	if (!gpio_96 && gpio_68) {
-		ts_info("TP is Goodix, initiating probe..\n");
+		ts_info("TP is Goodix, initializing..\n");
 	} else {
-		ts_info("TP is Focaltech, killing Goodix TP probe..\n");
+		ts_info("TP is Focaltech, killing Goodix TP init..\n");
 		return -ENODEV;
 	}
 #endif

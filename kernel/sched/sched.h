@@ -3226,6 +3226,10 @@ static inline bool is_per_cpu_kthread(struct task_struct *p)
 }
 #endif
 
+extern u64 avg_vruntime(struct cfs_rq *cfs_rq);
+extern int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se);
+extern bool dequeue_task(struct rq *rq, struct task_struct *p, int flags);
+
 #ifdef CONFIG_SPRD_ROTATION_TASK
 DECLARE_PER_CPU_SHARED_ALIGNED(bool, cpu_reserved);
 static inline bool is_reserved(int cpu)
@@ -3254,7 +3258,3 @@ static inline u64 sched_ktime_clock(void)
 	return sched_clock();
 }
 #endif
-
-extern u64 avg_vruntime(struct cfs_rq *cfs_rq);
-extern int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se);
-extern bool dequeue_task(struct rq *rq, struct task_struct *p, int flags);

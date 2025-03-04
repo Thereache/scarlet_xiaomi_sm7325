@@ -901,7 +901,7 @@ static inline void __free_one_page(struct page *page,
 		int migratetype)
 {
 	unsigned long combined_pfn;
-	unsigned long uninitialized_var(buddy_pfn);
+	unsigned long buddy_pfn;
 	struct page *buddy;
 	unsigned int max_order;
 	struct capture_control *capc = task_capc(zone);
@@ -4684,7 +4684,6 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
 	int reserve_flags;
 	bool woke_kswapd = false;
 	bool woke_kshrinkd = false;
-	bool used_vmpressure = false;
 
 	/*
 	 * We also sanity check to catch abuse of atomic reserves being used by
@@ -4728,8 +4727,6 @@ restart:
 			atomic_long_inc(&kshrinkd_waiters);
 			woke_kshrinkd = true;
 		}
-		if (!used_vmpressure)
-			used_vmpressure = vmpressure_inc_users(order);
 		wake_all_kswapds(order, gfp_mask, ac);
 	}
 
@@ -4854,8 +4851,6 @@ retry:
 		goto nopage;
 
 	/* Try direct reclaim and then allocating */
-	if (!used_vmpressure)
-		used_vmpressure = vmpressure_inc_users(order);
 	if (!woke_kshrinkd) {
 		/*
 		 * smp_mb__after_atomic() pairs with the wait_event_freezable()
@@ -4989,8 +4984,6 @@ got_pg:
 		atomic_long_dec(&kswapd_waiters);
 	if (woke_kshrinkd)
 		atomic_long_dec(&kshrinkd_waiters);
-	if (used_vmpressure)
-		vmpressure_dec_users();
 	if (!page)
 		warn_alloc(gfp_mask, ac->nodemask,
 				"page allocation failure: order:%u", order);

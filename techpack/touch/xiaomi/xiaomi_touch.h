@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
 #ifndef __XIAOMI__TOUCH_H
 #define __XIAOMI__TOUCH_H
 #include <linux/device.h>
@@ -25,21 +27,13 @@
 #include <linux/rtc.h>
 #include <linux/seq_file.h>
 
-/*CUR,DEFAULT,MIN,MAX*/
+/* CUR, DEFAULT, MIN, MAX */
 #define VALUE_TYPE_SIZE 6
 #define VALUE_GRIP_SIZE 9
 #define MAX_BUF_SIZE 256
 #define BTN_INFO 0x152
 #define MAX_TOUCH_ID 10
 #define RAW_BUF_NUM 4
-#define THP_CMD_BASE 1000
-
-enum suspend_state {
-	XIAOMI_TOUCH_RESUME = 0,
-	XIAOMI_TOUCH_SUSPEND,
-	XIAOMI_TOUCH_LP1,
-	XIAOMI_TOUCH_LP2,
-};
 
 enum MODE_CMD {
 	SET_CUR_VALUE = 0,
@@ -69,23 +63,13 @@ enum MODE_TYPE {
 	Touch_Idle_Time = 13,
 	Touch_Doubletap_Mode = 14,
 	Touch_Grip_Mode = 15,
-	Touch_FodIcon_Enable = 16,
-	Touch_Nonui_Mode = 17,
-	Touch_Debug_Level = 18,
 	Touch_Power_Status = 19,
 	Touch_Mode_NUM = 20,
-	THP_LOCK_SCAN_MODE = THP_CMD_BASE + 0,
-	THP_FOD_DOWNUP_CTL = THP_CMD_BASE + 1,
-	THP_SELF_CAP_SCAN = THP_CMD_BASE + 2,
-	THP_REPORT_POINT_SWITCH = THP_CMD_BASE + 3,
-	THP_HAL_INIT_READY = THP_CMD_BASE + 4,
 };
 
 struct xiaomi_touch_interface {
 	int thp_cmd_buf[MAX_BUF_SIZE];
-	char thp_cmd_data_buf[MAX_BUF_SIZE];
 	int thp_cmd_size;
-	int thp_cmd_data_size;
 	int touch_mode[Touch_Mode_NUM][VALUE_TYPE_SIZE];
 	int (*setModeValue)(int Mode, int value);
 	int (*setModeLongValue)(int Mode, int value_len, int *value);
@@ -107,8 +91,6 @@ struct xiaomi_touch_interface {
 	u8 (*panel_color_read)(void);
 	u8 (*panel_display_read)(void);
 	char (*touch_vendor_read)(void);
-	int long_mode_len;
-	int long_mode_value[MAX_BUF_SIZE];
 
 	bool is_enable_touchraw;
 	int thp_downthreshold;
@@ -143,7 +125,7 @@ enum touch_state {
 struct touch_event {
 	u32 slot;
 	enum touch_state state;
-	struct timespec touch_time;
+	struct timespec64 touch_time;
 };
 
 struct last_touch_event {
@@ -166,7 +148,6 @@ struct xiaomi_touch_pdata {
 	bool palm_changed;
 	int prox_value;
 	bool prox_changed;
-	const char *name;
 	struct proc_dir_entry *last_touch_events_proc;
 	struct last_touch_event *last_touch_events;
 };
@@ -175,8 +156,6 @@ struct xiaomi_touch *xiaomi_touch_dev_get(int minor);
 
 extern struct class *get_xiaomi_touch_class(void);
 
-extern struct device *get_xiaomi_touch_dev(void);
-
 extern int update_palm_sensor_value(int value);
 
 extern int update_prox_sensor_value(int value);
@@ -184,15 +163,4 @@ extern int update_prox_sensor_value(int value);
 extern int xiaomitouch_register_modedata(int touchId,
 					 struct xiaomi_touch_interface *data);
 
-extern int copy_touch_rawdata(char *raw_base, int len);
-
-extern int update_touch_rawdata(void);
-
-extern int update_clicktouch_raw(void);
-
-extern void last_touch_events_collect(int slot, int state);
-
-int xiaomi_touch_set_suspend_state(int state);
-
-extern void thp_send_cmd_to_hal(int cmd, int value);
-#endif
+#endif /* __XIAOMI__TOUCH_H */

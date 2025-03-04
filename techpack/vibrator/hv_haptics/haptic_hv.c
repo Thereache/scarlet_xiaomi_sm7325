@@ -620,6 +620,16 @@ static int ram_f0_cali(struct aw_haptic *aw_haptic)
 
 static void pm_qos_enable(struct aw_haptic *aw_haptic, bool enable)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+	if (enable) {
+		if (!cpu_latency_qos_request_active(&aw_haptic->aw_pm_qos_req_vb))
+			cpu_latency_qos_add_request(&aw_haptic->aw_pm_qos_req_vb,
+						    CPU_LATENCY_QOC_VALUE);
+	} else {
+		if (cpu_latency_qos_request_active(&aw_haptic->aw_pm_qos_req_vb))
+			cpu_latency_qos_remove_request(&aw_haptic->aw_pm_qos_req_vb);
+	}
+#else
 	if (enable) {
 		if (!pm_qos_request_active(&aw_haptic->aw_pm_qos_req_vb))
 			pm_qos_add_request(&aw_haptic->aw_pm_qos_req_vb,
@@ -629,6 +639,7 @@ static void pm_qos_enable(struct aw_haptic *aw_haptic, bool enable)
 		if (pm_qos_request_active(&aw_haptic->aw_pm_qos_req_vb))
 			pm_qos_remove_request(&aw_haptic->aw_pm_qos_req_vb);
 	}
+#endif
 }
 
 static int rtp_osc_cali(struct aw_haptic *aw_haptic)
@@ -1850,7 +1861,6 @@ static ssize_t gain_store(struct device *dev, struct device_attribute *attr,
 	rc = kstrtouint(buf, 0, &val);
 	if (rc < 0)
 		return rc;
-
 	aw_info("value=0x%02x", val);
 	mutex_lock(&aw_haptic->lock);
 	aw_haptic->gain = val;

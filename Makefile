@@ -651,12 +651,11 @@ LTO_LDFLAGS	:= $(CC_FLAGS_LTO) -Wno-lto-type-mismatch -Wno-psabi \
 LDFINAL		:= $(CONFIG_SHELL) $(srctree)/scripts/gcc-ld $(LTO_LDFLAGS)
 AR		:= $(CROSS_COMPILE)gcc-ar
 NM		:= $(CROSS_COMPILE)gcc-nm
-export CC_FLAGS_LTO
+export CC_FLAGS_LTO LDFINAL
 else
 LDFINAL		:= $(LD)
-endif
-
 export LDFINAL
+endif
 
 ifeq ($(KBUILD_EXTMOD),)
 # Objects we will link into vmlinux / subdirs we need to visit
@@ -833,16 +832,11 @@ KBUILD_CFLAGS += -Wno-tautological-compare
 KBUILD_CFLAGS += $(call cc-disable-warning, undefined-optimized)
 else
 
-# Warn about unmarked fall-throughs in switch statement.
-# Disabled for clang while comment to attribute conversion happens and
-# https://github.com/ClangBuiltLinux/linux/issues/636 is discussed.
-KBUILD_CFLAGS += $(call cc-option,-Wimplicit-fallthrough,)
-
 # Harmless warns but too noisy due to GCC's notorious aggressiveness
 KBUILD_CFLAGS += $(call cc-disable-warning, address)
 KBUILD_CFLAGS += $(call cc-disable-warning, array-compare)
-KBUILD_CFLAGS += $(call cc-disable-warning, stringop-overread)
 KBUILD_CFLAGS += $(call cc-disable-warning, format)
+KBUILD_CFLAGS += $(call cc-disable-warning, implicit-fallthrough)
 endif
 
 # These warnings generated too much noise in a regular build.

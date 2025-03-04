@@ -159,8 +159,6 @@ arch/arm/boot/dts/vendor
 # build directories
 /out
 /work
-/lisa
-/redwood
 
 # build log
 log.txt
