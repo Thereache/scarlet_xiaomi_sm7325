@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2011-2020 The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
@@ -5747,8 +5747,7 @@ static void lim_tx_mgmt_frame(struct mac_context *mac_ctx, uint8_t vdev_id,
 		session->peSessionId, qdf_status));
 	if (!QDF_IS_STATUS_SUCCESS(qdf_status)) {
 #ifdef WLAN_DEBUG
-		pe_err("*** Could not send Auth frame (subType: %d), retCode=%X ***",
-			fc->subType, qdf_status);
+		pe_err("Could not send Auth frame, retCode=%X", qdf_status);
 #endif
 		mac_ctx->auth_ack_status = LIM_TX_FAILED;
 		auth_ack_status = SENT_FAIL;
